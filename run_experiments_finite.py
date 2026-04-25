@@ -3,7 +3,7 @@ run_experiments_finite.py
 
 Author:     Dogyoon Song
 Created:    2025-09-27
-Revised:    2026-03-25
+Revised:    2026-04-25
 
 Purpose:
     Monte Carlo drivers for the manuscript experiments on finite-sample
@@ -12,7 +12,7 @@ Purpose:
 Contents:
     1. Lightweight configuration dataclasses and helper utilities
     2. Experiment drivers exp1, exp2, exp3, and exp4
-    3. A small CLI that currently dispatches exp3
+    3. A small CLI that dispatches exp1, exp2, and exp3
 
 Maintenance notes:
     - Reuse ols_primitives.py and finite_swap_module.py rather than duplicating logic.
@@ -116,14 +116,15 @@ def _z_from_delta(delta: float) -> float:
 @dataclass
 class MCConfig:
     # For B* (Appx04-Alg MCBias): number of assignments and pairs per assignment
-    B_S: int = 100
-    B_pair: int = 200
+    B_S: int = 30
+    B_pair: int = 30
     lambda_mode: str = "max"  # 'gap'|'ratio'|'max'
     # For (V*,R*) (Appx04-Alg MCVarRange)
     Bi: int = 10
-    Bcond: int = 25
+    Bcond: int = 10
+    Bj: int =   10      # 0 enumerates all admissible controls J; positive values sample Bj controls
     # Monte Carlo over assignments for coverage summaries
-    N_assign: int = 200
+    N_assign: int = 500
     # nominal level for CI
     delta: float = 0.05
 
@@ -194,8 +195,8 @@ def _make_signal_pair(X: np.ndarray, SNR: float, align: str, rng: np.random.Gene
 
 # ---------------------------------------------------------------------
 # Exp 1: DiM — FS vs Wald (Gaussian X), multi-δ, percentile envelopes,
-#         medians of (V*,R*), and a direct exact empirical analogue R_emp.
-#         Fast: no MC enumeration for "exact" range (closed form for DiM).
+#         exact remaining-pool oracle quantities (V*, R*), and
+#         terminal-assignment diagnostics (V_emp, R_emp).
 #         NOTE: DiM does not use X; we vary n only (γ-grid collapses to {0.0}).
 # ---------------------------------------------------------------------
 def exp1_dim_validity_multi_delta(
@@ -226,7 +227,9 @@ def exp1_dim_validity_multi_delta(
         nT, nC = max(len(yT), 1), max(len(yC), 1)
         return sT2 / nT + sC2 / nC
 
-    # exact, closed-form empirical analogue of R* for DiM (assignment-level, O(n))
+    # Closed-form terminal-assignment diagnostic for DiM.
+    # This is not the same object as the oracle (V*, R*) under the remaining-pool reveal law;
+    # it is an empirical surrogate used for Table 2 diagnostics.
     def _R_emp_dim(
         S1: np.ndarray, Pi: np.ndarray, y1: np.ndarray, y0: np.ndarray,
         n: int, n1: int, return_mu: bool = False
@@ -251,6 +254,49 @@ def exp1_dim_validity_multi_delta(
         R_emp = float(np.max(vals))
         return (R_emp, mu) if return_mu else R_emp
 
+    def _dim_exact_vr(
+        S1: np.ndarray,
+        Pi: np.ndarray,
+        y1: np.ndarray,
+        y0: np.ndarray,
+        n: int,
+        n1: int,
+    ) -> Tuple[float, float]:
+        """
+        Exact oracle (V*, R*) for DiM under the corrected remaining-pool law.
+
+        For DiM, write
+            a_i = y1_i / n1 + y0_i / n0.
+        For a revealed past S_past and remaining pool R, the one-step drift is
+            zeta_t(i) = E_J[a_J - a_i | i, S_past]
+                      = (sum_{u in R} a_u - |R| a_i) / (|R|-1),
+        with i uniform on R. This avoids generic swap Monte Carlo entirely.
+        """
+        n0 = n - n1
+        score = y1 / float(n1) + y0 / float(n0)
+
+        available = np.ones(n, dtype=bool)
+        Vsum = 0.0
+        Rmax = 0.0
+
+        for t, pos in enumerate(Pi):
+            m = int(np.sum(available))
+            if m <= 1:
+                break
+
+            vals = score[available]
+            mean_vals = float(np.mean(vals))
+            zeta = (m / float(m - 1)) * (mean_vals - vals)
+
+            alpha_t = fsm._alpha_t(n, n1, t + 1)
+            Vsum += (alpha_t ** 2) * float(np.var(zeta, ddof=0))
+            Rmax = max(Rmax, alpha_t * float(np.max(np.abs(zeta))))
+
+            # Reveal the actual treated unit for the next step.
+            available[int(S1[int(pos)])] = False
+
+        return float(Vsum), float(Rmax)
+
     # filename tag
     def _tag(vals, prefix): return prefix + "-".join(str(v).replace(".", "p") for v in vals)
     default_tag = "_".join([f"X{x_dist}", _tag(n_grid, "n"), _tag(gamma_grid, "g"), f"seed{grid.seed}"])
@@ -263,8 +309,10 @@ def exp1_dim_validity_multi_delta(
                        + [f"rad_fs_d{int(100*d):03d}" for d in deltas]
                        + [f"rad_wald_d{int(100*d):03d}" for d in deltas]
                        + ["err"])
-        lf = open(outdir / f"exp1_dim_validity_long__{tag}.csv", "w", newline="")
-        long_writer = csv.DictWriter(lf, fieldnames=long_fields); long_writer.writeheader()
+        long_tag = f"{tag}_R{int(R_outer)}_N{int(mc.N_assign)}_Bi{int(mc.Bi)}_Bcond{int(mc.Bcond)}"
+        lf = open(outdir / f"exp1_dim_validity_long__{long_tag}.csv", "w", newline="")
+        long_writer = csv.DictWriter(lf, fieldnames=long_fields)
+        long_writer.writeheader()
 
     outer_rows: Dict[Tuple[int,float], List[Dict[str, Any]]] = {}
 
@@ -291,34 +339,34 @@ def exp1_dim_validity_multi_delta(
                     S1 = rng.choice(n, size=n1, replace=False).astype(int)
                     Pi = fsm.make_random_reveal_order(n1, rng)
 
-                    # (V*,R*) MC for DiM (B*=0) — single MC call per assignment
-                    V, R, _ = fsm.estimate_VR_for_assignment(S1, X, y1, y0, Pi,
-                                                          Bi=int(mc.Bi), Bcond=int(mc.Bcond),
-                                                          rng=rng, method="DIM", branch="auto")
-                    V = float(V); R = float(R)
-                    V_list.append(V); R_list.append(R)
+                    # DiM admits an exact closed-form computation of the oracle
+                    # (V*, R*) under the remaining-pool reveal law.
+                    V, R = fsm.estimate_VR_DIM_exact(S1, X, y1, y0, Pi, rng=None)
+                    V = float(V)
+                    R = float(R)
+                    V_list.append(V)
+                    R_list.append(R)
 
-                    # exact, closed-form empirical analogue of R* for DiM, and μ for V_emp
+                    # Separately compute terminal-assignment empirical diagnostics.
+                    # These are useful benchmarks but are not identical to (V*, R*).
                     R_emp, mu = _R_emp_dim(S1, Pi, y1, y0, n=n, n1=n1, return_mu=True)
-                    R_emp_list.append(R_emp)
+                    R_emp = float(R_emp)
 
-                    # --- V_emp: sum_t α_t^2 Var( μ over remaining treated at step t ) ---
-                    # μ in reveal order
-                    mu_ord = mu[Pi]                 # length n1
-                    m = n1
-                    # prefix sums for tail means/variances
-                    pref1 = np.cumsum(mu_ord)       # Σ μ
-                    pref2 = np.cumsum(mu_ord * mu_ord)  # Σ μ^2
-                    var_tail = np.empty(m, dtype=float)
-                    tot1 = pref1[m-1]; tot2 = pref2[m-1]
-                    for t in range(m):
-                        s1 = tot1 - (pref1[t-1] if t > 0 else 0.0)
-                        s2 = tot2 - (pref2[t-1] if t > 0 else 0.0)
-                        k = m - t
-                        Ex = s1 / k; Ex2 = s2 / k
-                        var_tail[t] = max(Ex2 - Ex*Ex, 0.0)
-                    alpha_vec = np.array([fsm._alpha_t(n, n1, tt) for tt in range(1, n1+1)], dtype=float)
+                    mu_ord = mu[Pi]
+                    m = int(mu_ord.size)
+                    k_tail = np.arange(m, 0, -1, dtype=float)
+                    s1_tail = np.cumsum(mu_ord[::-1])[::-1]
+                    s2_tail = np.cumsum((mu_ord * mu_ord)[::-1])[::-1]
+                    mean_tail = s1_tail / k_tail
+                    var_tail = np.maximum(s2_tail / k_tail - mean_tail * mean_tail, 0.0)
+
+                    alpha_vec = np.array(
+                        [fsm._alpha_t(n, n1, tt) for tt in range(1, n1 + 1)],
+                        dtype=float,
+                    )
                     V_emp = float(np.sum((alpha_vec ** 2) * var_tail))
+
+                    R_emp_list.append(R_emp)
                     V_emp_list.append(V_emp)
 
                     err = float(fsm.tau_hat_DIM(S1, y1, y0) - tau_true)
@@ -356,24 +404,33 @@ def exp1_dim_validity_multi_delta(
                     "x_dist": x_dist, "Bi": int(mc.Bi), "Bcond": int(mc.Bcond), "N_assign": int(mc.N_assign),
                     "tau_true": tau_true,
                     "V_med": float(np.median(V_arr)), "V_mean": float(np.mean(V_arr)),
+                    "V_med_inner_var": float(np.var(V_arr, ddof=0)),
                     "R_med": float(np.median(R_arr)), "R_mean": float(np.mean(R_arr)),
+                    "R_med_inner_var": float(np.var(R_arr, ddof=0)),
                     "R_emp_med": float(np.median(R_emp_arr)),
+                    "R_emp_inner_var": float(np.var(R_emp_arr, ddof=0)),
                     "V_emp_med": float(np.median(V_emp_arr)),
+                    "V_emp_inner_var": float(np.var(V_emp_arr, ddof=0)),
                     "err_mean": float(np.mean(err_arr)), "err_sd": float(np.std(err_arr, ddof=1)),
                 }
                 for d in deltas:
                     rfs = np.asarray(rad_fs[d], dtype=float)
                     rwd = np.asarray(rad_wald[d], dtype=float)
+                    wfs = 2.0 * rfs
+                    wwd = 2.0 * rwd
                     rec[f"cov_fs_d{int(100*d):03d}"]         = float(np.mean(cov_fs[d]))      # mean across assignments
                     rec[f"cov_wald_d{int(100*d):03d}"]       = float(np.mean(cov_wald[d]))
-                    rec[f"width_fs_med_d{int(100*d):03d}"]   = _agg(rfs)                      # half-width (radius)
-                    rec[f"width_wald_med_d{int(100*d):03d}"] = _agg(rwd)                      # half-width (radius)
-                    rec[f"width_fs_mean_d{int(100*d):03d}"]  = float(np.mean(rfs))
-                    rec[f"width_wald_mean_d{int(100*d):03d}"] = float(np.mean(rwd))
-                    rec[f"width_fs_p10_d{int(100*d):03d}"]   = float(np.quantile(rfs, 0.10))
-                    rec[f"width_fs_p90_d{int(100*d):03d}"]   = float(np.quantile(rfs, 0.90))
-                    rec[f"width_wald_p10_d{int(100*d):03d}"] = float(np.quantile(rwd, 0.10))
-                    rec[f"width_wald_p90_d{int(100*d):03d}"] = float(np.quantile(rwd, 0.90))
+                    rec[f"width_fs_med_d{int(100*d):03d}"]   = _agg(wfs)
+                    rec[f"width_wald_med_d{int(100*d):03d}"] = _agg(wwd)
+                    tag_d = f"d{int(100*d):03d}"
+                    rec[f"width_fs_mean_{tag_d}"]  = float(np.mean(wfs))
+                    rec[f"width_wald_mean_{tag_d}"] = float(np.mean(wwd))
+                    rec[f"width_fs_var_{tag_d}"] = float(np.var(wfs, ddof=0))
+                    rec[f"width_wald_var_{tag_d}"] = float(np.var(wwd, ddof=0))
+                    rec[f"width_fs_p10_d{int(100*d):03d}"]   = float(np.quantile(wfs, 0.10))
+                    rec[f"width_fs_p90_d{int(100*d):03d}"]   = float(np.quantile(wfs, 0.90))
+                    rec[f"width_wald_p10_d{int(100*d):03d}"] = float(np.quantile(wwd, 0.10))
+                    rec[f"width_wald_p90_d{int(100*d):03d}"] = float(np.quantile(wwd, 0.90))
                 for q in perc_levels:
                     qlo = float(np.quantile(err_arr, q)); qhi = float(np.quantile(err_arr, 1.0-q))
                     rec[f"qlo_{int(1000*q):03d}"] = qlo; rec[f"qhi_{int(1000*q):03d}"] = qhi
@@ -391,20 +448,29 @@ def exp1_dim_validity_multi_delta(
         keys = [k for k in lst[0].keys() if k not in ("n", "gamma", "p")]
 
         def _outer_agg(key: str, vals: List[float]) -> float:
-            if key.startswith("cov_"):                 # coverage: mean across outer reps
+            if key.startswith("cov_"):
                 return float(np.mean(vals))
-            if "width_" in key and agg_width == "median":
-                return float(np.median(vals))          # robust median if requested
-            return float(np.mean(vals))                # default mean
+            if (
+                key.startswith("width_")
+                or key.startswith("qwidth_")
+                or key in {"V_med", "V_emp_med", "R_med", "R_emp_med"}
+            ):
+                return float(np.median(vals))
+            return float(np.mean(vals))
 
         for k in keys:
-            # collect values for this key across outer replicates
             vals = [r[k] for r in lst if k in r]
 
-            # numeric fields → aggregate; metadata (strings) → passthrough
             if all(isinstance(v, (int, float, np.integer, np.floating)) for v in vals):
                 fvals = [float(v) for v in vals]
                 base[k] = _outer_agg(k, fvals)
+
+                if (
+                    k.startswith("cov_")
+                    or k.startswith("qwidth_")
+                    or k in {"V_med", "V_emp_med", "R_med", "R_emp_med"}
+                ):
+                    base[f"{k}_outer_var"] = float(np.var(fvals, ddof=0))
             else:
                 # keep the first (all reps should have the same metadata value)
                 base[k] = vals[0]
@@ -450,11 +516,11 @@ def _tag_list(prefix, vals, fmt="{:g}"):
         s = fmt.format(vals)
     return f"{prefix}{s}"
 
-def _make_exp2_stem(ns, gammas, deltas, R, N, rho, Bi, Bcond, BS, Bpair):
+def _make_exp2_stem(ns, gammas, deltas, R, N, rho, Bi, Bcond, BS, Bpair, Bj=0):
     n_tag  = _tag_list("n", ns, "{:d}")
     g_tag  = _tag_list("g", gammas, "{:.2f}")
     d_tag  = _tag_list("d", deltas, "{:.2f}")
-    budg   = f"Bi{Bi}_Bcond{Bcond}_BS{BS}_Bpair{Bpair}"
+    budg   = f"Bi{Bi}_Bcond{Bcond}_Bj{Bj}_BS{BS}_Bpair{Bpair}"
     return f"exp2_ra_finite_ci__{n_tag}__{g_tag}__{d_tag}__R{int(R)}_N{int(N)}_rho{rho:.2f}__{budg}"
 
 
@@ -507,17 +573,20 @@ def exp2_ra_finite_ci(
         gammas=tuple(float(g) for g in gammas),
         deltas=tuple(float(d) for d in deltas),
         R=R, N=int(mc.N_assign), rho=float(grid.rho),
-        Bi=int(mc.Bi), Bcond=int(mc.Bcond), BS=int(mc.B_S), Bpair=int(mc.B_pair)
+        Bi=int(mc.Bi), Bcond=int(mc.Bcond), BS=int(mc.B_S),
+        Bpair=int(mc.B_pair), Bj=int(mc.Bj)
     )
     rep_path = outdir / f"{stem}__rep.csv"
     sum_path = outdir / f"{stem}__summary.csv"
     diag_path = outdir / f"{stem}__diagnostics.csv"   # optional; comment out if not desired
     raw_path = outdir / f"{stem}__raw.csv"
-    raw_header_written = raw_path.exists() and (raw_path.stat().st_size > 0)
+    if raw_path.exists():
+        raw_path.unlink()
+    raw_header_written = False
 
     raw_base_cols = [
         "n", "gamma", "p", "rep", "assign", "n1",
-        "B_RA", "Vhat_RA", "Rhat_RA", "Remp_RA", "Vpqv_RA",
+        "B_RA", "Vhat_RA", "Rhat_RA", "Rswap_RA", "Vpqv_RA",
         "tau_resid_RA", "tau_resid_DIM", "se_DIM"
     ]
     raw_delta_cols = []
@@ -536,7 +605,13 @@ def exp2_ra_finite_ci(
     groups = {}       # (n,gamma,p) -> list of replicate dicts for aggregation
 
     N = int(mc.N_assign)
-    Bi, Bcond, BS, Bpair = max(2, int(mc.Bi)), int(mc.Bcond), int(mc.B_S), int(mc.B_pair)
+    Bi, Bcond, Bj, BS, Bpair = (
+        max(2, int(mc.Bi)),
+        int(mc.Bcond),
+        int(mc.Bj),
+        int(mc.B_S),
+        int(mc.B_pair),
+    )
     rng0 = np.random.default_rng(grid.seed + 2202)
 
     for n in ns:
@@ -558,11 +633,12 @@ def exp2_ra_finite_ci(
                 n1 = int(round(grid.rho * n))
 
                 # B* once per instance (RA)
+                t_b0 = time.perf_counter()
                 B_RA, EG_RA, Varf_RA = fsm.estimate_Bstar(
-                    n1, X, y1, y0,
-                    BS=BS, Bpair=Bpair, rng=rng, method="RA",
-                    branch="auto", lambda_mode=mc.lambda_mode
+                    S1_size=n1, X=X, y1=y1, y0=y0, BS=BS, Bpair=Bpair, rng=rng,
+                    method="RA", branch="auto", lambda_mode=str(mc.lambda_mode)
                 )
+                t_bstar = time.perf_counter() - t_b0
 
                 # assignments + reveal orders
                 S_list, Pi_list = [], []
@@ -581,14 +657,19 @@ def exp2_ra_finite_ci(
                 stats_RA = {d: {"w": np.empty(N), "c": np.empty(N, int)} for d in deltas}
                 stats_DI = {d: {"w": np.empty(N), "c": np.empty(N, int)} for d in deltas}
 
+                t_vr_total = 0.0
                 for k in range(N):
                     S1, Pi = S_list[k], Pi_list[k]
-                    Vra, Rra, Vpq = fsm.estimate_VR_for_assignment(
+                    t_v0 = time.perf_counter()
+                    Vra, Rra, Vpq, Rswap = fsm.estimate_VR_for_assignment(
                         S1, X, y1, y0, Pi,
-                        Bi=Bi, Bcond=Bcond, rng=rng, method="RA", branch="auto"
+                        Bi=Bi, Bcond=Bcond, Bj=Bj,
+                        rng=rng, method="RA", branch="auto",
+                        return_rswap=True,
                     )
+                    t_vr_total += time.perf_counter() - t_v0
                     Vhat[k], Rhat[k] = float(Vra), float(Rra)
-                    Remp[k] = float(fsm.compute_R_emp_RA(S1, X, y1, y0, Pi, Bcond=Bcond, rng=rng, branch="auto"))
+                    Remp[k] = float(Rswap)   # sampled raw-swap range diagnostic
                     Vpqv[k] = float(Vpq)
 
                     th_ra  = float(fsm.tau_hat_RA(S1, X, y1, y0))
@@ -616,7 +697,7 @@ def exp2_ra_finite_ci(
                         "rep": int(rep), "assign": int(k), "n1": int(n1),
                         "B_RA": float(B_RA),
                         "Vhat_RA": float(Vhat[k]), "Rhat_RA": float(Rhat[k]),
-                        "Remp_RA": float(Remp[k]), "Vpqv_RA": float(Vpqv[k]),
+                        "Rswap_RA": float(Remp[k]), "Vpqv_RA": float(Vpqv[k]),
                         "tau_resid_RA": float(resid_RA[k]),
                         "tau_resid_DIM": float(resid_DIM[k]),
                         "se_DIM": float(_wald_neyman_se_dim(y1, y0, S_list[k])),
@@ -640,18 +721,24 @@ def exp2_ra_finite_ci(
                 EmpVar_DIM = float(np.var(resid_DIM, ddof=0))
                 IPR_RA     = float(np.quantile(resid_RA, 0.975) - np.quantile(resid_RA, 0.025))
                 IPR_DIM    = float(np.quantile(resid_DIM, 0.975) - np.quantile(resid_DIM, 0.025))
+                Bemp_abs   = float(abs(np.mean(resid_RA)))
 
                 rec = {
                     "n": int(n), "gamma": float(gamma), "p": int(p), "rep": int(rep),
                     "N_assign": int(N), "rho": float(grid.rho),
-                    "Bi": int(Bi), "Bcond": int(Bcond), "BS": int(BS), "Bpair": int(Bpair),
+                    "Bi": int(Bi), "Bcond": int(Bcond), "Bj": int(Bj),
+                    "BS": int(BS), "Bpair": int(Bpair),
                     "B_RA": float(B_RA), "EGamma_RA": float(EG_RA), "Varf_RA": float(Varf_RA),
                     "EmpVar_RA": EmpVar_RA, "EmpVar_DIM": EmpVar_DIM, "IPR_RA": IPR_RA, "IPR_DIM": IPR_DIM,
-                    "Remp_RA_med": float(np.median(Remp)),
-                    "Remp_RA_var": float(np.var(Remp, ddof=0)),
+                    "Bemp_absmean_RA": Bemp_abs,
+                    "Rswap_RA_med": float(np.median(Remp)),
+                    "Rswap_RA_var": float(np.var(Remp, ddof=0)),
                     "Vpqv_med_assign": float(np.median(Vpqv)),
                     "Vhat_med_assign": float(np.median(Vhat)),
                     "Rhat_med_assign": float(np.median(Rhat)),
+                    "t_bstar": float(t_bstar),
+                    "t_vr_total": float(t_vr_total),
+                    "t_vr_per_assign": float(t_vr_total / max(N, 1)),
                 }
                 for d in deltas:
                     wra, wdi = stats_RA[d]["w"], stats_DI[d]["w"]
@@ -695,27 +782,36 @@ def exp2_ra_finite_ci(
     for (n, gamma, p), rows in groups.items():
         row = {"n": n, "gamma": gamma, "p": p, "R": len(rows)}
         EmpVar_RA_all  = np.array([r["EmpVar_RA"] for r in rows], dtype=float)
-        Remp_all = np.array([r["Remp_RA_med"] for r in rows], dtype=float)
+        Remp_all = np.array([r["Rswap_RA_med"] for r in rows], dtype=float)
         IPR_RA_all     = np.array([r["IPR_RA"] for r in rows], dtype=float)
         IPR_DIM_all    = np.array([r["IPR_DIM"]   for r in rows], dtype=float)
+        Bemp_abs_all   = np.array([r["Bemp_absmean_RA"] for r in rows], dtype=float)
+        B_RA_all       = np.array([r["B_RA"] for r in rows], dtype=float)
+
         row["EmpVar_RA_med"] = float(np.median(EmpVar_RA_all))
-        row["Remp_RA_med"] = float(np.median(Remp_all))
-        row["Remp_RA_var"] = float(np.var(Remp_all, ddof=0))
+        row["Rswap_RA_med"] = float(np.median(Remp_all))
+        row["Rswap_RA_var"] = float(np.var(Remp_all, ddof=0))
         row["IPR_RA_med"]    = float(np.median(IPR_RA_all))
         row["IPR_RA_var"]    = float(np.var(IPR_RA_all, ddof=0))
         row["IPR_DIM_med"]   = float(np.median(IPR_DIM_all))
         row["IPR_DIM_var"]   = float(np.var(IPR_DIM_all, ddof=0))
+        row["Bemp_absmean_RA_med"] = float(np.median(Bemp_abs_all))
+        row["B_RA_med"] = float(np.median(B_RA_all))
+
         for d in deltas:
             mw_ra  = np.array([r[f"mean_width_RA@{d}"]  for r in rows], dtype=float)
             mw_di  = np.array([r[f"mean_width_DIM@{d}"] for r in rows], dtype=float)
+            vw_ra  = np.array([r[f"var_width_RA@{d}"]   for r in rows], dtype=float)
+            vw_di  = np.array([r[f"var_width_DIM@{d}"]  for r in rows], dtype=float)
             mc_ra  = np.array([r[f"mean_cov_RA@{d}"]    for r in rows], dtype=float)
             mc_di  = np.array([r[f"mean_cov_DIM@{d}"]   for r in rows], dtype=float)
+
             row[f"width_RA_medOfMeans@{d}"]  = float(np.median(mw_ra))
             row[f"width_DIM_medOfMeans@{d}"] = float(np.median(mw_di))
+            row[f"width_RA_paren@{d}"]       = float(np.median(vw_ra))
+            row[f"width_DIM_paren@{d}"]      = float(np.median(vw_di))
             row[f"cov_RA_medOfMeans@{d}"]    = float(np.median(mc_ra))
             row[f"cov_DIM_medOfMeans@{d}"]   = float(np.median(mc_di))
-            # parentheses for manuscript tables:
-            row[f"width_paren@{d}"]          = float(np.median(EmpVar_RA_all))
             row[f"cov_RA_paren@{d}"]         = float(np.var(mc_ra, ddof=0))
             row[f"cov_DIM_paren@{d}"]        = float(np.var(mc_di, ddof=0))
         sum_rows.append(row)
@@ -736,10 +832,12 @@ def exp2_ra_finite_ci(
             "Rhat_med_var": float(np.var([r["Rhat_med_assign"] for r in rows], ddof=0)),
             "Bhat_med": float(np.median([r["B_RA"] for r in rows])),
             "Bhat_var": float(np.var([r["B_RA"] for r in rows], ddof=0)),
+            "Bemp_absmean_RA_med": float(np.median([r["Bemp_absmean_RA"] for r in rows])),
+            "Bemp_absmean_RA_var": float(np.var([r["Bemp_absmean_RA"] for r in rows], ddof=0)),
             "EmpVar_RA_med": float(np.median([r["EmpVar_RA"] for r in rows])),
             "EmpVar_RA_var": float(np.var([r["EmpVar_RA"] for r in rows], ddof=0)),
-            "Remp_RA_med": float(np.median([r["Remp_RA_med"] for r in rows])),
-            "Remp_RA_var": float(np.var([r["Remp_RA_med"] for r in rows], ddof=0)),
+            "Rswap_RA_med": float(np.median([r["Rswap_RA_med"] for r in rows])),
+            "Rswap_RA_var": float(np.var([r["Rswap_RA_med"] for r in rows], ddof=0)),
             "Vpqv_med_med": float(np.median([r["Vpqv_med_assign"] for r in rows])),
             "Vpqv_med_var": float(np.var([r["Vpqv_med_assign"] for r in rows], ddof=0)),
         })
@@ -759,12 +857,12 @@ def exp2_ra_finite_ci(
 # ---------------------------------------------------------------------
 
 
-def _make_exp3_stem(ns, gammas, thetas, deltas, R, N, rho, Bi, Bcond, BS, Bpair):
+def _make_exp3_stem(ns, gammas, thetas, deltas, R, N, rho, Bi, Bcond, BS, Bpair, Bj=0):
     n_tag  = _tag_list("n", ns, "{:d}")
     g_tag  = _tag_list("g", gammas, "{:.2f}")
     t_tag  = _tag_list("t", thetas, "{:.2f}")
     d_tag  = _tag_list("d", deltas, "{:.2f}")
-    budg   = f"Bi{Bi}_Bcond{Bcond}_BS{BS}_Bpair{Bpair}"
+    budg   = f"Bi{Bi}_Bcond{Bcond}_Bj{Bj}_BS{BS}_Bpair{Bpair}"
     return f"exp3_strong_signal__{n_tag}__{g_tag}__{t_tag}__{d_tag}__R{int(R)}_N{int(N)}_rho{rho:.2f}__{budg}"
 
 
@@ -792,18 +890,21 @@ def exp3_strong_signal_ra_bo(
         thetas=tuple(float(t) for t in thetas),
         deltas=tuple(float(d) for d in deltas),
         R=R, N=int(mc.N_assign), rho=float(grid.rho),
-        Bi=int(mc.Bi), Bcond=int(mc.Bcond), BS=int(mc.B_S), Bpair=int(mc.B_pair)
+        Bi=int(mc.Bi), Bcond=int(mc.Bcond), BS=int(mc.B_S),
+        Bpair=int(mc.B_pair), Bj=int(mc.Bj)
     )
     rep_path = outdir / f"{stem}__rep.csv"
     sum_path = outdir / f"{stem}__summary.csv"
     raw_path = outdir / f"{stem}__raw.csv"
     diag_path = outdir / f"{stem}__diagnostics.csv"
-    raw_header_written = raw_path.exists() and (raw_path.stat().st_size > 0)
+    if raw_path.exists():
+        raw_path.unlink()
+    raw_header_written = False
 
     # --- raw schema = Exp.2 + (theta) + RAbo fields
     raw_base_cols = [
         "n", "gamma", "p", "theta", "rep", "assign", "n1",
-        "B_RA", "Vhat_RA", "Rhat_RA", "Remp_RA", "Vpqv_RA",
+        "B_RA", "Vhat_RA", "Rhat_RA", "Rswap_RA", "Vpqv_RA",
         "tau_resid_RA", "tau_resid_DIM", "se_DIM"
     ]
     raw_delta_cols = []
@@ -817,7 +918,9 @@ def exp3_strong_signal_ra_bo(
 
     # budgets / constants
     N = int(mc.N_assign)
-    Bi, Bcond, BS, Bpair = max(2, int(mc.Bi)), int(mc.Bcond), int(mc.B_S), int(mc.B_pair)
+    Bi, Bcond, Bj, BS, Bpair = (
+        max(2, int(mc.Bi)), int(mc.Bcond), int(mc.Bj), int(mc.B_S), int(mc.B_pair)
+    )
     rng0 = np.random.default_rng(grid.seed + 3303)
 
     rep_rows = []
@@ -880,11 +983,19 @@ def exp3_strong_signal_ra_bo(
 
                         S1, Pi = S_list[k], Pi_list[k]
                         Vra, Rra, Vpq = fsm.estimate_VR_for_assignment(
-                            S1, X, y1, y0, Pi, Bi=Bi, Bcond=Bcond, rng=rng, method="RA", branch="auto"
+                            S1, X, y1, y0, Pi,
+                            Bi=Bi, Bcond=Bcond, Bj=Bj,
+                            rng=rng, method="RA", branch="auto"
                         )
                         Vra = float(Vra); Rra = float(Rra)
                         Vhat[k], Rhat[k], Vpqv[k] = Vra, Rra, float(Vpq)
-                        Remp[k] = float(fsm.compute_R_emp_RA(S1, X, y1, y0, Pi, Bcond=Bcond, rng=rng, branch="auto"))
+                        Remp[k] = float(
+                            fsm.compute_R_emp_RA(
+                                S1, X, y1, y0, Pi,
+                                Bcond=Bcond, rng=rng, branch="auto",
+                                Bi_emp=Bi, Bj=Bj
+                            )
+                        )
 
                         th_ra  = float(fsm.tau_hat_RA(S1, X, y1, y0))
                         th_dim = float(fsm.tau_hat_DIM(S1, y1, y0))
@@ -937,7 +1048,7 @@ def exp3_strong_signal_ra_bo(
                             "rep": int(rep), "assign": int(k), "n1": int(n1),
                             "B_RA": float(B_RA),
                             "Vhat_RA": float(Vhat[k]), "Rhat_RA": float(Rhat[k]),
-                            "Remp_RA": float(Remp[k]), "Vpqv_RA": float(Vpqv[k]),
+                            "Rswap_RA": float(Remp[k]), "Vpqv_RA": float(Vpqv[k]),
                             "tau_resid_RA": float(resid_RA[k]),
                             "tau_resid_DIM": float(resid_DIM[k]),
                             "se_DIM": float(_wald_neyman_se_dim(y1, y0, S_list[k])),
@@ -972,7 +1083,7 @@ def exp3_strong_signal_ra_bo(
                         "EmpVar_RA": EmpVar_RA, "EmpVar_DIM": EmpVar_DIM,
                         "IPR_RA": IPR_RA, "IPR_DIM": IPR_DIM,
                         "Bemp_absmean_RA": Bemp_abs,
-                        "Remp_RA_med": float(np.median(Remp)), "Remp_RA_var": float(np.var(Remp, ddof=0)),
+                        "Rswap_RA_med": float(np.median(Remp)), "Rswap_RA_var": float(np.var(Remp, ddof=0)),
                         "Vpqv_med_assign": float(np.median(Vpqv)),
                         "Vhat_med_assign": float(np.median(Vhat)),
                         "Rhat_med_assign": float(np.median(Rhat)),
@@ -1027,12 +1138,12 @@ def exp3_strong_signal_ra_bo(
         EmpVar_RA_all  = np.array([r["EmpVar_RA"] for r in rows], dtype=float)
         IPR_RA_all     = np.array([r["IPR_RA"] for r in rows], dtype=float)
         IPR_DIM_all    = np.array([r["IPR_DIM"] for r in rows], dtype=float)
-        Remp_all       = np.array([r["Remp_RA_med"] for r in rows], dtype=float)
+        Remp_all       = np.array([r["Rswap_RA_med"] for r in rows], dtype=float)
         Bemp_abs_all   = np.array([r["Bemp_absmean_RA"] for r in rows], dtype=float)
 
         row["EmpVar_RA_med"]  = float(np.median(EmpVar_RA_all))
-        row["Remp_RA_med"]    = float(np.median(Remp_all))
-        row["Remp_RA_var"]    = float(np.var(Remp_all, ddof=0))
+        row["Rswap_RA_med"]    = float(np.median(Remp_all))
+        row["Rswap_RA_var"]    = float(np.var(Remp_all, ddof=0))
         row["IPR_RA_med"]     = float(np.median(IPR_RA_all))
         row["IPR_RA_var"]     = float(np.var(IPR_RA_all, ddof=0))
         row["IPR_DIM_med"]    = float(np.median(IPR_DIM_all))
@@ -1077,8 +1188,8 @@ def exp3_strong_signal_ra_bo(
             "Bhat_var":     float(np.var([r["B_RA"] for r in rows], ddof=0)),
             "EmpVar_RA_med": float(np.median([r["EmpVar_RA"] for r in rows])),
             "EmpVar_RA_var": float(np.var([r["EmpVar_RA"] for r in rows], ddof=0)),
-            "Remp_RA_med":   float(np.median([r["Remp_RA_med"] for r in rows])),
-            "Remp_RA_var":   float(np.var([r["Remp_RA_med"] for r in rows], ddof=0)),
+            "Rswap_RA_med":   float(np.median([r["Rswap_RA_med"] for r in rows])),
+            "Rswap_RA_var":   float(np.var([r["Rswap_RA_med"] for r in rows], ddof=0)),
             "Vpqv_med_med":  float(np.median([r["Vpqv_med_assign"] for r in rows])),
             "Vpqv_med_var":  float(np.var([r["Vpqv_med_assign"] for r in rows], ddof=0)),
         })
@@ -1192,29 +1303,36 @@ def exp4_power_vs_alt(grid: ExpGrid, mc: MCConfig, outdir: Path,
 def _parse_which(s: str) -> Tuple[str, ...]:
     s = (s or "").strip()
     if not s:
-        return ("exp3",)
+        return ("exp1",)
     return tuple(x.strip().lower() for x in s.split(",") if x.strip())
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Run finite-swap Monte Carlo experiments (RA/DiM).")
-    ap.add_argument("--which", type=str, default="exp3",
-                    help="Comma-separated subset of {exp3}.")
+    ap.add_argument("--which", type=str, default="exp1",
+                    help="Comma-separated subset of {exp1,exp2,exp3}.")
+    ap.add_argument("--ns", type=str, default="",
+                    help="Comma-separated n values. Defaults are experiment-specific.")
     ap.add_argument("--outdir", type=str, default="./results", help="Output directory.")
     ap.add_argument("--seed", type=int, default=12345, help="Base RNG seed.")
     ap.add_argument("--n", type=int, default=50, help="Population size n.")
     ap.add_argument("--rho", type=float, default=0.3, help="Treatment fraction.")
-    ap.add_argument("--gammas", type=str, default="1.25",
-                    help="Comma-separated γ values for p=⌈n^γ⌉. For exp2 we use 0.75,1.25 by default.")
+    ap.add_argument("--gammas", type=str, default="",
+                    help="Comma-separated gamma values for p=ceil(n^gamma). If omitted, each experiment uses its default grid.")
     ap.add_argument("--snrs", type=str, default="0.0,1.0,2.0",#,4.0,8.0,16.0",
                     help="Comma-separated SNR values retained for the programmatic Experiment 2 interface.")
     ap.add_argument("--thetas", type=str, default="1.0,2.0,4.0",
                     help="Comma-separated θ values for Experiment 3 (strong signal).")
-    ap.add_argument("--Nassign", type=int, default=50, help="# assignments per design for coverage.")
-    ap.add_argument("--BS", type=int, default=100, help="# assignments for B* (MC)")
-    ap.add_argument("--Bpair", type=int, default=50, help="# (i,j) pairs per assignment for B* (MC)")
+
+    ap.add_argument("--R", type=int, default=20,
+                    help="# outer finite-population replicates.")
+    ap.add_argument("--Nassign", type=int, default=500, help="# assignments per design for coverage.")
+    ap.add_argument("--BS", type=int, default=30, help="# assignments for B* (MC)")
+    ap.add_argument("--Bpair", type=int, default=30, help="# (i,j) pairs per assignment for B* (MC)")
     ap.add_argument("--Bi", type=int, default=10, help="# candidate i's per step for (V,R) MC")
     ap.add_argument("--Bcond", type=int, default=10, help="# proxied completions T per i for (V,R) MC")
+    ap.add_argument("--Bj", type=int, default=10,
+                    help="# admissible controls J sampled per completion for RA MCVarRange; 0 enumerates all.")
     ap.add_argument("--delta", type=float, default=0.05, help="CI nominal miscoverage.")
     ap.add_argument("--apply_ucb", action="store_true",
                     help="Retained for the programmatic Experiment 4 interface; not used by the current CLI path.")
@@ -1228,10 +1346,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     outdir = Path(args.outdir)
     gammas = tuple(float(x) for x in args.gammas.split(",")) if args.gammas else ()
+    ns_arg = tuple(int(x) for x in args.ns.split(",")) if getattr(args, "ns", "") else ()    
     snrs = tuple(float(x) for x in args.snrs.split(",")) if args.snrs else ()
     thetas = tuple(float(x) for x in args.thetas.split(",")) if getattr(args, "thetas", None) else ()
     which = set(_parse_which(args.which))
-    supported = {"exp3"}
+    supported = {"exp1", "exp2", "exp3"}
     unsupported = sorted(which - supported)
     if unsupported:
         raise ValueError(
@@ -1240,7 +1359,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         )
 
     grid = ExpGrid(n=int(args.n), rho=float(args.rho), gammas=gammas, SNRs=snrs, seed=int(args.seed))
-    mc   = MCConfig(B_S=int(args.BS), B_pair=int(args.Bpair), Bi=int(args.Bi), Bcond=int(args.Bcond),
+    mc   = MCConfig(B_S=int(args.BS), B_pair=int(args.Bpair),
+                    Bi=int(args.Bi), Bcond=int(args.Bcond), Bj=int(args.Bj),
                     N_assign=int(args.Nassign), delta=float(args.delta))
     
     apply_ucb  = bool(getattr(args, "apply_ucb", False))
@@ -1249,29 +1369,36 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
 
     # Run selected experiments
-    # if "exp1" in which:
-    #     # exp1_validity_ra(grid, mc, outdir)
-    #     exp1_dim_validity_multi_delta(grid, mc, outdir,
-    #         n_grid=(10, 20, 40, 80, 160, 320, 640), gamma_grid=(0.0,),
-    #         R_outer=25, agg_width="mean", save_full=True)
-    # if "exp2" in which:
-    #     exp2_ra_finite_ci(
-    #         grid, mc, outdir,
-    #         ns=(100,),# 100),#, 400),
-    #         gammas=(0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5),
-    #         # gammas=(0.25, 0.5, 0.75, 1.25,),
-    #         deltas=(0.05,),
-    #         R=5,
-    #         x_dist="gauss"
-    #     )
+
+    if "exp1" in which:
+        exp1_dim_validity_multi_delta(
+            grid, mc, outdir,
+            n_grid=ns_arg if ns_arg else (10, 20, 40, 80, 160, 320, 640),
+            gamma_grid=(0.0,),
+            R_outer=int(args.R),
+            agg_width="mean",
+            save_full=True,
+        )
+
+    if "exp2" in which:
+        exp2_ra_finite_ci(
+            grid, mc, outdir,
+            ns=ns_arg if ns_arg else (50,),
+            # gammas=gammas if gammas else (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5),
+            gammas=gammas if gammas else (1.5,),
+            deltas=(float(args.delta),),
+            R=int(args.R),
+            x_dist="gauss",
+        )
+
     if "exp3" in which:
         exp3_strong_signal_ra_bo(
             grid, mc, outdir,
-            ns=(int(args.n),),
+            ns=ns_arg if ns_arg else (int(args.n),),
             gammas=gammas if gammas else (0.25, 0.75, 1.25),
             thetas=thetas if thetas else (1.0, 2.0, 4.0),
             deltas=(float(args.delta),),
-            R=5,
+            R=int(args.R),
             x_dist="gauss",
         )
 
