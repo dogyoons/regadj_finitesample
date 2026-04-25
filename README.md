@@ -15,23 +15,17 @@ This repository contains the Python code used for the simulation studies in the 
 
 ## What the code computes
 
-The manuscript studies finite-sample confidence intervals based on the oracle quantities
-\[
-V^\star,\qquad R^\star,\qquad B^\star.
-\]
+The manuscript studies finite-sample confidence intervals based on the oracle quantities $V^\star,\qquad R^\star,\qquad B^\star$.
 
 The code supports the following experiment types.
 
 ### 1. DiM experiments
-For DiM, the remaining-pool oracle quantities \(V^\star\) and \(R^\star\) admit closed forms under the reveal law used in the paper, and \(B^\star=0\).  
+For DiM, the remaining-pool oracle quantities $V^\star$ and $R^\star$ admit closed forms under the reveal law used in the paper, and $B^\star=0$.  
 Accordingly, the DiM finite-sample radius is computed from exact oracle quantities rather than Monte Carlo approximations.
 
 ### 2. OLS--RA experiments
-For OLS--RA, the oracle quantities are approximated by Monte Carlo estimators
-\[
-\widehat V^\star,\qquad \widehat R^\star,\qquad \widehat B^\star.
-\]
-The current implementation uses the **direct Monte Carlo estimate** of \(\widehat R^\star\).  
+For OLS--RA, the oracle quantities are approximated by Monte Carlo estimators $\widehat V^\star,\qquad \widehat R^\star,\qquad \widehat B^\star$.
+The current implementation uses the **direct Monte Carlo estimate** of $\widehat R^\star$.  
 An optional one-sided UCB correction is implemented in the helper code, but it is not used in the manuscript tables.
 
 ### 3. Diagnostic quantities
