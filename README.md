@@ -37,9 +37,9 @@ An optional one-sided UCB correction is implemented in the helper code, but it i
 ### 3. Diagnostic quantities
 The code also records diagnostic quantities used in the appendix discussion, including
 
-- \(V_{\mathrm{PQV}}\): the pre-de-noising predictable-quadratic-variation diagnostic,
-- \(R_{\mathrm{swap}}\): the sampled raw-swap range diagnostic,
-- \(B_{\mathrm{emp}}\): empirical absolute bias over sampled assignments.
+- $V_{\mathrm{PQV}}$: the pre-de-noising predictable-quadratic-variation diagnostic,
+- $R_{\mathrm{swap}}$: the sampled raw-swap range diagnostic,
+- $B_{\mathrm{emp}}$: empirical absolute bias over sampled assignments.
 
 These are diagnostics tied to the implemented Monte Carlo pipeline; they are not alternative oracle parameters.
 
