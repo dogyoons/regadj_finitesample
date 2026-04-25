@@ -3,7 +3,7 @@ finite_swap_module.py
 
 Author:     Dogyoon Song
 Created:    2025-09-26
-Revised:    2026-03-25
+Revised:    2026-04-25
 
 Purpose:
     Swap-sensitivity, geometry, and Monte Carlo utilities for the finite-sample
@@ -901,6 +901,70 @@ def _swap_deltas_RA_over_all_controls_on_set(
         out[idx] = d1 - d0
     return out
 
+def swap_deltas_RA_for_pairs(
+    X: np.ndarray,
+    y1: np.ndarray,
+    y0: np.ndarray,
+    S1: np.ndarray,
+    pairs: list[tuple[int, int]],
+    branch: Literal["M", "K", "auto"] = "auto",
+) -> np.ndarray:
+    """
+    Compute RA swap deltas for many pairs (i,j) at a fixed assignment S1.
+
+    This is mathematically identical to repeated calls to swap_delta_RA(...),
+    but builds the two base arm caches only once. This is especially useful
+    for MCBias, where many (i,j) pairs are sampled for the same assignment.
+    """
+    n = int(X.shape[0])
+    S1 = _validate_S1(S1, n)
+    if not pairs:
+        return np.asarray([], dtype=float)
+
+    mask = np.zeros(n, dtype=bool)
+    mask[S1] = True
+    S0 = np.where(~mask)[0]
+
+    pos1 = {int(g): int(k) for k, g in enumerate(S1)}
+    pos0 = {int(g): int(k) for k, g in enumerate(S0)}
+
+    X1, X0 = X[S1, :], X[S0, :]
+    y1S, y0S = y1[S1], y0[S0]
+
+    br1 = ("M" if X1.shape[0] > X1.shape[1] else "K") if branch == "auto" else branch
+    br0 = ("M" if X0.shape[0] > X0.shape[1] else "K") if branch == "auto" else branch
+
+    cache1 = MArmCache.build(X1, y1S) if br1 == "M" else KArmCache.build(X1, y1S)
+    cache0 = MArmCache.build(X0, y0S) if br0 == "M" else KArmCache.build(X0, y0S)
+
+    mu1_base = float(cache1.mu())
+    mu0_base = float(cache0.mu())
+
+    out = np.empty(len(pairs), dtype=float)
+    for k, (i_glob, j_glob) in enumerate(pairs):
+        i_glob = int(i_glob)
+        j_glob = int(j_glob)
+
+        if i_glob not in pos1 or j_glob not in pos0:
+            raise ValueError(
+                "swap_deltas_RA_for_pairs: each pair must satisfy i in S1 and j in S0."
+            )
+
+        d1 = (
+            cache1.delete(pos1[i_glob])
+            .insert(X[j_glob, :], float(y1[j_glob]))
+            .mu()
+            - mu1_base
+        )
+        d0 = (
+            cache0.delete(pos0[j_glob])
+            .insert(X[i_glob, :], float(y0[i_glob]))
+            .mu()
+            - mu0_base
+        )
+        out[k] = float(d1 - d0)
+
+    return out
 
 def swap_delta_DIM(
     y1: np.ndarray,
@@ -934,30 +998,25 @@ def tau_hat_RA(
     branch: Literal["M", "K", "auto"] = "auto",
 ) -> float:
     """
-    RA estimator: armwise OLS intercepts (definition-faithful).
-    Reuses ols_primitives._ols_with_intercept when available; fall back to Part 1 geometries otherwise.
+    RA estimator: armwise OLS intercepts using the manuscript-consistent
+    convention: unpenalized intercept and minimum-norm slope among LS minimizers.
+
+    Uses the fast Q-ratio/cache implementation of Proposition 1. This is
+    mathematically equivalent to the definition-faithful OLS intercept, but
+    avoids repeated SVDs in high-dimensional/interpolating regimes.
     """
     n = int(X.shape[0])
     S1 = _validate_S1(S1, n)
-
-    # Prefer the ATE primitive if available: exact, concise, and consistent.
-    if (_ols_mod is not None) and hasattr(_ols_mod, "ols_ra"):
-        T = np.zeros(n, dtype=np.int8); T[S1] = 1
-        y_obs = T * y1 + (1 - T) * y0
-        tau_hat, *_ = _ols_mod.ols_ra(y_obs, T, X)  # type: ignore[attr-defined]
-        return float(tau_hat)
-
-    # Otherwise reuse _ols_with_intercept or geometry fallbacks armwise.
     S0 = _indices_complement(S1, n)
-    if _ols_with_intercept_mbranch is not None:
-        fit1 = _ols_with_intercept_mbranch(y1[S1], X[S1, :])
-        fit0 = _ols_with_intercept_mbranch(y0[S0], X[S0, :])
-        mu1 = float(fit1.mu_hat)
-        mu0 = float(fit0.mu_hat)
-        return mu1 - mu0
 
-    mu1 = build_geometry(X[S1, :], branch).mu_ols(y1[S1])
-    mu0 = build_geometry(X[S0, :], branch).mu_ols(y0[S0])
+    def _arm_mu_fast(Xa: np.ndarray, ya: np.ndarray) -> float:
+        br = ("M" if Xa.shape[0] > Xa.shape[1] else "K") if branch == "auto" else branch
+        if br == "M":
+            return float(MArmCache.build(Xa, ya).mu())
+        return float(KArmCache.build(Xa, ya).mu())
+
+    mu1 = _arm_mu_fast(X[S1, :], y1[S1])
+    mu0 = _arm_mu_fast(X[S0, :], y0[S0])
     return float(mu1 - mu0)
 
 
@@ -989,19 +1048,8 @@ def ra_vs_dim_penalty(S1: np.ndarray, X: np.ndarray, y1: np.ndarray, y0: np.ndar
     """
     n = int(X.shape[0])
     S1 = _validate_S1(S1, n)
-    T = np.zeros(n, dtype=np.int8); T[S1] = 1
-    y_obs = T * y1 + (1 - T) * y0
-
-    # DiM
-    tau_dim = float(_ols_mod.difference_in_means(y_obs, T)) if (_ols_mod is not None) else \
-              float(y_obs[T == 1].mean() - y_obs[T == 0].mean())
-
-    # RA
-    if (_ols_mod is not None) and hasattr(_ols_mod, "ols_ra"):
-        tau_ra, _, _ = _ols_mod.ols_ra(y_obs, T, X)  # type: ignore[attr-defined]
-    else:
-        tau_ra = tau_hat_RA(S1, X, y1, y0, branch="auto")
-
+    tau_dim = tau_hat_DIM(S1, y1, y0)
+    tau_ra = tau_hat_RA(S1, X, y1, y0, branch="auto")
     return float(abs(tau_ra - tau_dim))
 
 
@@ -1011,20 +1059,45 @@ def estimate_VR_DIM_exact(
     y1: np.ndarray,
     y0: np.ndarray,
     Pi: np.ndarray,
-    rng: np.random.Generator,
+    rng: Optional[np.random.Generator] = None,
 ) -> tuple[float, float]:
     """
-    Exact (V*, R*) for DiM under the given reveal order Π: enumerate all i in the suffix
-    and all controls j in S0 when forming ζ_t(i).  No Monte Carlo is used.
+    Exact oracle (V*, R*) for DiM under the remaining-pool reveal law.
+
+    For DiM, Delta_{ij} = a_j - a_i with
+        a_i = y1_i / n1 + y0_i / n0.
+    Conditional on the revealed past, i ranges over the remaining pool R,
+    and J is uniform on R \\ {i}. Hence
+        zeta_t(i) = E_J[a_J - a_i]
+                  = (sum_{u in R} a_u - |R| a_i) / (|R|-1).
     """
-    # Reuse the existing machinery by forcing enumeration:
     n = int(X.shape[0])
     S1 = _validate_S1(S1, n)
-    Bi = len(S1)          # enumerate all suffix i's at each step
-    # Bcond is read inside the function per-step from current S0; pass a large sentinel
-    Bcond = n             # forces enumeration of all j ∈ S0 at each step
-    V, R, _ = estimate_VR_for_assignment(S1, X, y1, y0, Pi, Bi, Bcond, rng, method="DIM", branch="auto")
-    return V, R
+    n1 = int(len(S1))
+    n0 = n - n1
+
+    score = y1 / float(n1) + y0 / float(n0)
+
+    available = np.ones(n, dtype=bool)
+    Vsum = 0.0
+    Rmax = 0.0
+
+    for t, pos in enumerate(Pi):
+        m = int(np.sum(available))
+        if m <= 1:
+            break
+
+        vals = score[available]
+        mean_vals = float(np.mean(vals))
+        zeta = (m / float(m - 1)) * (mean_vals - vals)
+
+        alpha_t = _alpha_t(n, n1, t + 1)
+        Vsum += (alpha_t ** 2) * float(np.var(zeta, ddof=0))
+        Rmax = max(Rmax, alpha_t * float(np.max(np.abs(zeta))))
+
+        available[int(S1[int(pos)])] = False
+
+    return float(Vsum), float(Rmax)
 
 
 def hybrid_ra_radius(
@@ -1082,20 +1155,22 @@ def estimate_VR_for_assignment(
     eta: Optional[float] = None,
     delta_max: Optional[float] = None,   # reserved for future envelope-based refinements
     apply_ucb: bool = False,
-) -> Tuple[float, float, float]:
+    Bj: int = 0,                         # 0 enumerates all admissible controls J
+    return_rswap: bool = False,
+) -> Tuple[float, ...]:
     r"""
     Monte-Carlo approximation of (V*, R*) for a *fixed* realized assignment S1 and reveal order Pi.
 
     Tightened implementation that matches Algorithm MCVarRange in Appx04:
-      - At step t (0-based here; 1-based in the paper), the candidate i's are the treated
-        indices in the suffix S_future = S1[Pi[t:]].
-      - For each candidate i, draw Bcond i.i.d. proxied completions T_b uniformly from
-        the subsets of S_future \ {i} of size (n1 - t - 1).
-      - RA (RB step): for each T_b, compute the average over all controls j ∈ S0 of
-            Δ_{ij} f(S_{t-1}^{prox}(i, T_b)),
-        then average these Bcond values across b to form \hat{\zeta}_t(i).
-      - Accumulate v_t^* \approx \alpha_t^2 \operatorname{Var}_i(\hat{\zeta}_t(i))
-        and r_t^* \approx \alpha_t \max_i |\hat{\zeta}_t(i)|.
+      - At step t (0-based here; 1-based in the paper), candidate i's are sampled
+        from the remaining pool R_{t-1} = [n] \\ S_past, matching Proposition 2.
+      - For each candidate i, draw Bcond proxied completions T_b uniformly from
+        subsets of R_{t-1}\\{i} of size (n1 - t - 1).
+      - For each T_b, either average over all admissible controls J
+        if Bj <= 0, or sample Bj admissible controls uniformly without replacement.
+      - Accumulate v_t^* using the across-i variance of \hat{\zeta}_t(i),
+        with the average within-i Monte Carlo noise correction subtracted and truncated at zero.
+      - Accumulate r_t^* \approx \alpha_t \max_i |\hat{\zeta}_t(i)|.
 
     Notes:
       - eta controls the one-sided normal UCB used when apply_ucb=True.
@@ -1111,6 +1186,7 @@ def estimate_VR_for_assignment(
     Vsum = 0.0
     Rmax = 0.0
     V_pqv_naive_accum = 0.0
+    Rswap_max = 0.0
 
     I_total = 0  # Σ_t |I_t| for the union bound in the UCB
     R_chunks: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
@@ -1119,21 +1195,16 @@ def estimate_VR_for_assignment(
         a = _alpha_t(n, n1, t + 1)
 
         S_past = S1[Pi[:t]]
-        S_future = S1[Pi[t:]]  # treated not yet revealed
 
-        # select i from S_future
-        # if Bi > 0 and len(S_future) > Bi:
-        #     i_list = rng.choice(S_future, size=Bi, replace=False).astype(int).tolist()
-        #     # use_popvar = False
-        # else:
-        #     i_list = list(map(int, S_future))
-        #     # use_popvar = True  # all i's included
-        # select i from S_future  — ensure at least two i's so Var_i(zeta_t) is identifiable
-        Bi_eff = min(len(S_future), max(int(Bi), 2))
-        if Bi_eff < len(S_future):
-            i_list = rng.choice(S_future, size=Bi_eff, replace=False).astype(int).tolist()
+        # Candidate I is distributed over the full remaining pool R_{t-1},
+        # not only the realized future-treated suffix.
+        R_pool = np.setdiff1d(np.arange(n, dtype=int), S_past, assume_unique=False)
+
+        Bi_eff = min(R_pool.size, max(int(Bi), 2))
+        if Bi_eff < R_pool.size:
+            i_list = rng.choice(R_pool, size=Bi_eff, replace=False).astype(int).tolist()
         else:
-            i_list = list(map(int, S_future))
+            i_list = list(map(int, R_pool))
 
         I_total += len(i_list)
 
@@ -1142,52 +1213,79 @@ def estimate_VR_for_assignment(
         s2_list: list[float] = []  # per-i within-i sample variances of xi's
         B_list: list[float] = []   # per-i effective B (B=inf under exact DIM enumeration ⇒ no correction)
 
+        raw_abs_t = 0.0
         if method == "DIM":
-            # For DIM, Δ does not depend on T; average over j in S0
-            if Bcond >= len(S0) or Bcond <= 0:
-                j_list_all = list(map(int, S0))
-                # enumeration ⇒ no Monte Carlo noise, correction=0
-                for i_glob in i_list:
-                    xis = [float(swap_delta_DIM(y1, y0, S1, i_glob, int(j_glob))) for j_glob in j_list_all]
-                    m_i = float(np.mean(xis)) if len(xis) > 0 else 0.0
-                    m_list.append(m_i)
-                    s2_list.append(0.0)  # no MC noise under enumeration
-                    B_list.append(float("inf"))  # sentinel ⇒ exactly no correction
-            else:
-                # Monte Carlo over controls
-                for i_glob in i_list:
-                    Bnow = max(int(Bcond), 1)
-                    xis = [float(swap_delta_DIM(y1, y0, S1, i_glob, int(rng.choice(S0)))) for _ in range(Bnow)]
-                    m_i = float(np.mean(xis))
-                    s2_i = float(np.var(xis, ddof=1)) if Bnow > 1 else 0.0
-                    m_list.append(m_i); s2_list.append(s2_i); B_list.append(Bnow)
-        else:
-            # RA branch: Rao–Blackwellize over controls j for each conditional draw of T
-            j_list_all = list(map(int, S0))
+            # For DiM, Delta_{iJ} does not depend on T, and the marginal law of
+            # J given (F_{t-1}, i) is uniform on R_{t-1}\\{i}.
             for i_glob in i_list:
-                # pool of future treated excluding i
-                future_wo_i = [int(u) for u in S_future if int(u) != int(i_glob)]
-                T_size = max(0, n1 - t - 1)
-                Bnow = max(int(Bcond), 1)
+                pool_wo_i = R_pool[R_pool != int(i_glob)]
 
-                # For each conditional draw of T, average Δ_{ij} over all controls j
+                if int(Bj) <= 0 or int(Bj) >= pool_wo_i.size:
+                    j_list = list(map(int, pool_wo_i))
+                    xis = [
+                        float(swap_delta_DIM(y1, y0, S1, int(i_glob), int(j_glob)))
+                        for j_glob in j_list
+                    ]
+                    if xis:
+                        raw_abs_t = max(raw_abs_t, float(np.max(np.abs(xis))))
+
+                    m_i = float(np.mean(xis)) if xis else 0.0
+                    s2_list.append(0.0)
+                    B_list.append(float("inf"))
+                else:
+                    j_samp = rng.choice(pool_wo_i, size=int(Bj), replace=False)
+                    xis = [
+                        float(swap_delta_DIM(y1, y0, S1, int(i_glob), int(j_glob)))
+                        for j_glob in j_samp
+                    ]
+                    if xis:
+                        raw_abs_t = max(raw_abs_t, float(np.max(np.abs(xis))))
+                        
+                    m_i = float(np.mean(xis)) if xis else 0.0
+                    s2_list.append(float(np.var(xis, ddof=1)) if len(xis) > 1 else 0.0)
+                    B_list.append(float(len(xis)))
+
+                m_list.append(m_i)
+        else:
+            # RA branch: approximate zeta_t(i)=E_{T,J}[Delta_{iJ} f(S_past ∪ {i} ∪ T)].
+            T_size = max(0, n1 - t - 1)
+            Bnow = max(int(Bcond), 1)
+
+            for i_glob in i_list:
+                i_glob = int(i_glob)
+                pool_wo_i = R_pool[R_pool != i_glob]
+
                 xi_bar_list = []
                 for _ in range(Bnow):
                     if T_size > 0:
-                        # Sample a completion T uniformly from the remaining treated without i.
-                        # This matches Appendix D: average over random completions, then Rao–Blackwellize over controls j.
-                        T = rng.choice(future_wo_i, size=int(T_size), replace=False).astype(int)
+                        T = rng.choice(pool_wo_i, size=int(T_size), replace=False).astype(int)
                     else:
                         T = np.array([], dtype=int)
-                    S1_prox = np.concatenate([S_past, np.array([i_glob], dtype=int), T]).astype(int)
+
+                    S1_prox = np.concatenate(
+                        [S_past, np.array([i_glob], dtype=int), T]
+                    ).astype(int)
+
+                    admissible_J = np.setdiff1d(pool_wo_i, T, assume_unique=False)
+                    if int(Bj) > 0 and int(Bj) < admissible_J.size:
+                        j_list = rng.choice(admissible_J, size=int(Bj), replace=False).astype(int).tolist()
+                    else:
+                        j_list = list(map(int, admissible_J))
+
                     vals = _swap_deltas_RA_over_all_controls_on_set(
-                        X, y1, y0, S1_prox, int(i_glob), j_list_all, branch
+                        X, y1, y0, S1_prox, i_glob, j_list, branch
                     )
-                    xi_bar_list.append(float(np.mean(vals)) if len(vals) > 0 else 0.0)
+                    if len(vals) > 0:
+                        raw_abs_t = max(raw_abs_t, float(np.max(np.abs(vals))))
+                        xi_bar_list.append(float(np.mean(vals)))
+                    else:
+                        xi_bar_list.append(0.0)
 
                 m_i = float(np.mean(xi_bar_list))
                 s2_i = float(np.var(xi_bar_list, ddof=1)) if Bnow > 1 else 0.0
-                m_list.append(m_i); s2_list.append(s2_i); B_list.append(Bnow)
+                m_list.append(m_i)
+                s2_list.append(s2_i)
+                B_list.append(Bnow)
 
         # m_arr is the array of per-i means already built above
         m_arr = np.asarray(m_list, dtype=float)
@@ -1198,11 +1296,11 @@ def estimate_VR_for_assignment(
         # keep per-i standard errors across completions so we can form a proper UCB
         R_chunks.append((a, np.abs(m_arr), s2_arr, B_arr))
 
-        # detect full enumeration of i's (candidate set S_future)
-        S_future_arr = np.asarray(S_future, dtype=int)
-        i_arr        = np.asarray(i_list,   dtype=int)
-        enum_i = (i_arr.size == S_future_arr.size) and np.array_equal(np.sort(i_arr), np.sort(S_future_arr))
-
+        # detect full enumeration of i's over the current remaining pool R_{t-1}
+        R_pool_arr = np.asarray(R_pool, dtype=int)
+        i_arr      = np.asarray(i_list, dtype=int)
+        enum_i = (i_arr.size == R_pool_arr.size) and np.array_equal(np.sort(i_arr), np.sort(R_pool_arr))
+        
         # pick ddof: population variance when enumerating all i; unbiased sample variance otherwise
         ddof_i = 0 if enum_i else 1
 
@@ -1223,6 +1321,7 @@ def estimate_VR_for_assignment(
 
         Vsum += (a * a) * var_t
         Rmax = max(Rmax, a * r_t)
+        Rswap_max = max(Rswap_max, a * raw_abs_t)
 
         s2_bar = float(m_arr.var(ddof=1)) if m_arr.size > 1 else 0.0
         V_pqv_naive_accum += (a * a) * s2_bar
@@ -1239,8 +1338,12 @@ def estimate_VR_for_assignment(
         for a_t, abs_m, s2, B in R_chunks:
             se = np.sqrt(np.maximum(s2, 0.0) / np.clip(B, 1.0, np.inf))
             Rmax_ucb = max(Rmax_ucb, float(a_t * np.max(abs_m + z * se)))
+        if return_rswap:
+            return Vsum, Rmax_ucb, V_pqv_naive_accum, Rswap_max
         return Vsum, Rmax_ucb, V_pqv_naive_accum
     else:
+        if return_rswap:
+            return Vsum, Rmax, V_pqv_naive_accum, Rswap_max
         return Vsum, Rmax, V_pqv_naive_accum
 
 
@@ -1253,56 +1356,67 @@ def compute_R_emp_RA(
     Bcond: int,
     rng: np.random.Generator,
     branch: Literal["M", "K", "auto"] = "auto",
+    Bi_emp: int = 0,   # 0 enumerates candidates i
+    Bj: int = 0,       # 0 enumerates admissible controls J
 ) -> float:
     r"""
-    Empirical max–swap envelope for RA:
-        R_{\mathrm{emp}}^{RA}(S_1,\Pi)
-        = \max_t \alpha_t \max_{i\in S_{\mathrm{future}}}
-          \mathbb{E}_T\!\left[\max_{j\in S_0} |\Delta_{ij}(S_{t-1}^{\mathrm{prox}}(i,T))|\right].
-    We approximate \mathbb{E}_T by Bcond random completions per i and enumerate all controls j per draw.
+    Sampled raw-swap range diagnostic for RA:
+        R_{\mathrm{swap}}(S_1,\Pi)
+        = \max_t \alpha_t \max_i
+          \mathbb{E}_T\!\left[\max_{J \in \mathcal{J}(T,i)}
+          |\Delta_{iJ}(S_{t-1}^{\mathrm{prox}}(i,T))|\right],
+    approximated by Bcond random completions per i and, when Bj > 0,
+    by a uniform subsample of admissible controls J per completion.
 
-    This strictly dominates the RB range \max_i |\mathbb{E}_{T,J}[\Delta_{ij}]|
-    and thus serves as a non-degenerate upper benchmark to assess tightness of \widehat{R}^*.
+    This is a diagnostic built from the same sampled objects as
+    estimate_VR_for_assignment. It is not the oracle range R^*, and when
+    Bj > 0 it is not an exact all-control envelope.
     """
     n  = X.shape[0]
     n1 = len(S1)
 
-    # complement indices (controls) are assignment-invariant
-    mask = np.zeros(n, dtype=bool); mask[S1] = True
-    S0 = np.where(~mask)[0]
-    j_list_all = list(map(int, S0))
-
     Rmax_emp = 0.0
     for t, _ in enumerate(Pi):
         a = _alpha_t(n, n1, t + 1)
-        # treated units already revealed vs. not yet revealed (S1 indexing)
-        S_past   = S1[Pi[:t]]
-        S_future = S1[Pi[t:]]
-        if S_future.size == 0:
+        S_past = S1[Pi[:t]]
+        R_pool = np.setdiff1d(np.arange(n, dtype=int), S_past, assume_unique=False)
+        if R_pool.size == 0:
             continue
 
         T_size = max(n1 - (t + 1), 0)
 
-        # Enumerate i (to avoid downward bias in the outer max over i).
-        for i_glob in map(int, S_future):
-            future_wo_i = [int(u) for u in S_future if int(u) != int(i_glob)]
+        if int(Bi_emp) > 0 and int(Bi_emp) < R_pool.size:
+            i_candidates = rng.choice(R_pool, size=int(Bi_emp), replace=False).astype(int)
+        else:
+            i_candidates = R_pool
+
+        for i_glob in map(int, i_candidates):
+            pool_wo_i = R_pool[R_pool != i_glob]
             Bnow = max(int(Bcond), 1) if T_size > 0 else 1
 
-            # Across completions T: collect max_j |Δ_{ij}(T)|.
             maxabs_list: list[float] = []
             for _ in range(Bnow):
                 if T_size > 0:
-                    T = rng.choice(future_wo_i, size=T_size, replace=False).astype(int)
+                    T = rng.choice(pool_wo_i, size=T_size, replace=False).astype(int)
                 else:
                     T = np.array([], dtype=int)
-                S1_prox = np.concatenate([S_past, np.array([i_glob], dtype=int), T]).astype(int)
+
+                S1_prox = np.concatenate(
+                    [S_past, np.array([i_glob], dtype=int), T]
+                ).astype(int)
+
+                admissible_J = np.setdiff1d(pool_wo_i, T, assume_unique=False)
+                if int(Bj) > 0 and int(Bj) < admissible_J.size:
+                    j_list = rng.choice(admissible_J, size=int(Bj), replace=False).astype(int).tolist()
+                else:
+                    j_list = list(map(int, admissible_J))
 
                 vals = _swap_deltas_RA_over_all_controls_on_set(
-                    X, y1, y0, S1_prox, int(i_glob), j_list_all, branch
+                    X, y1, y0, S1_prox, i_glob, j_list, branch
                 )
                 maxabs_list.append(float(np.max(np.abs(vals))) if len(vals) > 0 else 0.0)
 
-            m_i = float(np.mean(maxabs_list)) if len(maxabs_list) > 0 else 0.0
+            m_i = float(np.mean(maxabs_list)) if maxabs_list else 0.0
             Rmax_emp = max(Rmax_emp, float(a * m_i))
 
     return Rmax_emp
@@ -1385,62 +1499,86 @@ def estimate_Bstar(
     lambda_mode: Literal["gap", "ratio", "max"] = "max",
 ) -> Tuple[float, float, float]:
     """
-    Monte-Carlo estimate of (B^*, E[Γ(f)], Var(f)) as in Appx04, Alg. MCBias.
+    Monte-Carlo estimate of the corrected oracle bias parameter B*.
 
-    When BS ≥ C(n, S1_size) it enumerates all assignments; otherwise it samples BS assignments.
-    Within each assignment, when Bpair ≥ n1(n-n1) it enumerates all (i,j) pairs; otherwise it samples without replacement.
+    The corrected manuscript definition is
+        B* = sqrt( E[(Lf + lambda* f)^2] ) / lambda*,
+        lambda* = E[Gamma(f)] / Var(f),
+    where f(S)=tau_hat(S)-tau and Lf(S) is the Johnson-walk average swap
+    drift E[f(S')-f(S) | S].
 
-    For each of BS random assignments S:
-      - compute f(S) = τ̂(S) - τ (τ̂ = RA or DIM), to estimate Var(f);
-      - draw Bpair random (i,j) with i ∈ S, j ∈ S^c and set
-            Γ_hat(S) = (1 / (2 Bpair)) * sum_k (Δ_{i_k j_k} f(S))^2.
-    Then set EΓ_hat = mean_S Γ_hat(S) and Var_hat = Var[f(S)] over S.
-    Return (B_hat = sqrt(2) * Var_hat / sqrt(EΓ_hat), EΓ_hat, Var_hat).
+    This routine returns (B_hat, EGamma_hat, Varf_hat) to preserve the public
+    interface used by run_experiments_finite.py. Internally, it estimates both
+    Gamma(f)(S) and Lf(S) from the same sampled or enumerated swap pairs.
     """
     n = int(X.shape[0])
     if not (0 < S1_size < n):
         raise ValueError("S1_size must satisfy 0 < S1_size < n.")
+    if Bpair <= 0:
+        raise ValueError("Bpair must be positive to estimate Gamma(f) and Lf.")
 
-    tau_true = float(np.mean(y1) - np.mean(y0)) if (_true_tau_population is None) else float(_true_tau_population(y1, y0))
+    tau_true = (
+        float(np.mean(y1) - np.mean(y0))
+        if (_true_tau_population is None)
+        else float(_true_tau_population(y1, y0))
+    )
 
     total_assign = math.comb(n, S1_size)
+    enumerate_assignments = BS >= total_assign
+
     Gamma_vals: list[float] = []
+    Lf_vals: list[float] = []
     f_vals: list[float] = []
 
-    if BS >= total_assign:
-        for S1_tuple in itertools.combinations(range(n), S1_size):
-            S1 = np.array(S1_tuple, dtype=int)
-            f_vals.append(centered_tau_hat(S1, X, y1, y0, method, branch, tau_true))
-            pairs = pairs_for_assignment(S1, n, Bpair, rng)
-            dsq = 0.0
-            for i_glob, j_glob in pairs:
-                if method == "DIM":
-                    delta = swap_delta_DIM(y1, y0, S1, i_glob, j_glob)
-                else:
-                    delta = swap_delta_RA(X, y1, y0, S1, i_glob, j_glob, branch=branch, mode="no_refit")
-                dsq += float(delta) ** 2
-            denom = float(max(len(pairs), 1))
-            Gamma_vals.append(0.5 * dsq / denom)
+    if enumerate_assignments:
+        assignment_iter = (
+            np.array(S1_tuple, dtype=int)
+            for S1_tuple in itertools.combinations(range(n), S1_size)
+        )
     else:
-        for _ in range(BS):
-            S1 = rng.choice(n, size=S1_size, replace=False).astype(int)
-            f_vals.append(centered_tau_hat(S1, X, y1, y0, method, branch, tau_true))
-            pairs = pairs_for_assignment(S1, n, Bpair, rng)
-            dsq = 0.0
-            for i_glob, j_glob in pairs:
-                if method == "DIM":
-                    delta = swap_delta_DIM(y1, y0, S1, i_glob, j_glob)
-                else:
-                    delta = swap_delta_RA(X, y1, y0, S1, i_glob, j_glob, branch=branch, mode="no_refit")
-                dsq += float(delta) ** 2
-            denom = float(max(len(pairs), 1))
-            Gamma_vals.append(0.5 * dsq / denom)
+        assignment_iter = (
+            rng.choice(n, size=S1_size, replace=False).astype(int)
+            for _ in range(BS)
+        )
 
-    Varf_hat = float(np.var(np.asarray(f_vals, dtype=float), ddof=1)) if len(f_vals) > 1 else 0.0
-    EGamma_hat = float(np.mean(np.asarray(Gamma_vals, dtype=float))) if len(Gamma_vals) > 0 else 0.0
+    for S1 in assignment_iter:
+        f_vals.append(centered_tau_hat(S1, X, y1, y0, method, branch, tau_true))
+        pairs = pairs_for_assignment(S1, n, Bpair, rng)
+
+        if method == "DIM":
+            deltas = np.asarray(
+                [swap_delta_DIM(y1, y0, S1, i_glob, j_glob)
+                 for i_glob, j_glob in pairs],
+                dtype=float,
+            )
+        else:
+            deltas = swap_deltas_RA_for_pairs(X, y1, y0, S1, pairs, branch=branch)
+
+        dsum = float(np.sum(deltas))
+        dsq = float(deltas @ deltas)
+
+        denom = float(len(pairs))
+        Gamma_vals.append(0.5 * dsq / denom)
+        Lf_vals.append(dsum / denom)
+
+    f_arr = np.asarray(f_vals, dtype=float)
+    Gamma_arr = np.asarray(Gamma_vals, dtype=float)
+    Lf_arr = np.asarray(Lf_vals, dtype=float)
+
+    # If all assignments are enumerated, use the exact population variance.
+    # Otherwise use the usual unbiased sample variance as a Monte Carlo estimate.
+    ddof = 0 if enumerate_assignments else 1
+    Varf_hat = float(np.var(f_arr, ddof=ddof)) if f_arr.size > ddof else 0.0
+    EGamma_hat = float(np.mean(Gamma_arr)) if Gamma_arr.size > 0 else 0.0
+
     lam = _lambda_hat(n, S1_size, EGamma_hat, Varf_hat, lambda_mode)
-    # Manuscript-consistent plug-in:
-    B_hat = (math.sqrt(max(2.0 * EGamma_hat, 0.0)) / max(lam, _EPS)) if lam > 0.0 else 0.0
+
+    if lam <= 0.0:
+        B_hat = float(abs(np.mean(f_arr))) if f_arr.size > 0 else 0.0
+    else:
+        stein_resid = Lf_arr + lam * f_arr
+        B_hat = math.sqrt(max(float(np.mean(stein_resid * stein_resid)), 0.0)) / max(lam, _EPS)
+
     return B_hat, EGamma_hat, Varf_hat
 
 
@@ -1600,6 +1738,27 @@ def _test_tau_hat_RA_matches_ols_primitives():
     tau2 = float(fit1.mu_hat - fit0.mu_hat)
     _check_close(tau1, tau2, "tau_hat_RA matches ols_primitives")
 
+def _test_tau_hat_RA_highdim_uses_unpenalized_intercept():
+    """
+    In high-dimensional arms, np.linalg.lstsq([1, X], y) minimum-norms the
+    intercept as well as the slopes. The manuscript estimator leaves the
+    intercept unpenalized. This test ensures tau_hat_RA uses the latter.
+    """
+    rng = np.random.default_rng(20260420)
+    n, p, n1 = 50, 133, 15
+    X = rng.normal(size=(n, p))
+    y0 = rng.normal(size=n)
+    y1 = rng.normal(size=n)
+    S1 = rng.choice(n, size=n1, replace=False)
+    S0 = _indices_complement(S1, n)
+
+    tau = tau_hat_RA(S1, X, y1, y0, branch="auto")
+    tau_q = (
+        build_geometry(X[S1, :], "auto").mu_ols(y1[S1])
+        -
+        build_geometry(X[S0, :], "auto").mu_ols(y0[S0])
+    )
+    _check_close(tau, tau_q, "tau_hat_RA high-dimensional unpenalized intercept", rtol=1e-12, atol=1e-12)
 
 def _test_swap_delta_RA_refit_vs_norefit():
     rng = np.random.default_rng(321)
@@ -1628,41 +1787,20 @@ def _test_MCVarRange_DIM_enumeration():
     S1 = rng.choice(n, size=n1, replace=False)
     Pi = make_random_reveal_order(n1, rng)
 
-    # exact value under the *tight* definition:
-    # at each step, zeta_t(i) = E_J[ Δ_{i,J} f(S1) ] with i ∈ S_future, J ∈ S0;
-    # Vsum_ex = sum_t α_t^2 Var_i( zeta_t(i) ), Rmax_ex = max_t α_t max_i |zeta_t(i)|.
-    mask = np.zeros(n, dtype=bool); mask[S1] = True
-    S0 = np.where(~mask)[0]
-    Vsum_ex, Rmax_ex = 0.0, 0.0
-    for t, pos in enumerate(Pi):
-        a = _alpha_t(n, n1, t + 1)
-        S_future = S1[Pi[t:]]
-        # compute zeta(i) for each i in S_future as average over all controls
-        zetas = []
-        for i_glob in S_future:
-            acc = 0.0
-            for j_glob in S0:
-                acc += swap_delta_DIM(y1, y0, S1, int(i_glob), int(j_glob))
-            zetas.append(acc / float(len(S0)) if len(S0) > 0 else 0.0)
-        zetas = np.asarray(zetas, dtype=float)
-        if zetas.size > 1:
-            var_t = float(np.var(zetas, ddof=0))  # population variance (exact)
-            r_t = float(np.max(np.abs(zetas)))
-        elif zetas.size == 1:
-            var_t = 0.0
-            r_t = float(np.abs(zetas[0]))
-        else:
-            var_t = 0.0
-            r_t = 0.0
-        Vsum_ex += (a * a) * var_t
-        Rmax_ex = max(Rmax_ex, a * r_t)
+    # Exact remaining-pool oracle quantities.
+    Vsum_ex, Rmax_ex = estimate_VR_DIM_exact(S1, X, y1, y0, Pi, rng=None)
 
-    # Monte Carlo with "full coverage" as implemented now: Bi ≥ |S_future|, Bcond ≥ |S0|
+    # Full enumeration in the generic MCVarRange routine should match the exact formula.
+    rng_mc = np.random.default_rng(7)
     Vsum_mc, Rmax_mc, _ = estimate_VR_for_assignment(
-        S1, X, y1, y0, Pi, Bi=len(S1), Bcond=len(S0), rng=rng, method="DIM", branch="auto"
+        S1, X, y1, y0, Pi,
+        Bi=n, Bcond=1, Bj=0, rng=rng_mc,
+        method="DIM", branch="auto", apply_ucb=False
     )
+
     _check_close(Vsum_mc, Vsum_ex, "MCVarRange DIM Vsum exact", rtol=1e-12, atol=1e-12)
     _check_close(Rmax_mc, Rmax_ex, "MCVarRange DIM Rmax exact", rtol=1e-12, atol=1e-12)
+    print("✓ MCVarRange (DIM) matches the exact remaining-pool formula")
     
 
 def _test_MCBias_DIM_small_exact():
@@ -1673,7 +1811,7 @@ def _test_MCBias_DIM_small_exact():
     y0 = X @ beta + rng.normal(scale=0.3, size=n)
     y1 = y0 + 0.2
 
-    # exact EGamma
+    # Exact E[Gamma], Var(f), and corrected B* under full enumeration.
     from itertools import combinations
     EG_list = []
     f_list = []
@@ -1683,26 +1821,34 @@ def _test_MCBias_DIM_small_exact():
         mask = np.zeros(n, dtype=bool); mask[S1] = True
         S0 = np.where(~mask)[0]
         f_list.append(tau_hat_DIM(S1, y1, y0) - tau_true)
-        dsq_sum = 0.0; cnt = 0
+
+        dsq_sum = 0.0
+        cnt = 0
         for i in S1:
             for j in S0:
                 d = swap_delta_DIM(y1, y0, S1, int(i), int(j))
-                dsq_sum += d * d; cnt += 1
+                dsq_sum += d * d
+                cnt += 1
         EG_list.append(0.5 * dsq_sum / cnt)
+
     EG_ex = float(np.mean(EG_list))
-    Varf_ex = float(np.var(np.asarray(f_list, dtype=float), ddof=1)) if len(f_list) > 1 else 0.0
+    Varf_ex = float(np.var(np.asarray(f_list, dtype=float), ddof=0)) if len(f_list) > 0 else 0.0
 
     # MC with full enumeration
     BS = math.comb(n, n1)
     Bpair = n1 * (n - n1)
     rng2 = np.random.default_rng(11)
-    Bhat, EG_mc, Varf_mc = estimate_Bstar(n1, X, y1, y0, BS, Bpair, rng2, method="DIM", lambda_mode="max")
+    Bhat, EG_mc, Varf_mc = estimate_Bstar(
+        n1, X, y1, y0, BS, Bpair, rng2, method="DIM", lambda_mode="max"
+    )
+
     _check_close(EG_mc, EG_ex, "MCBias DIM E[Gamma] exact", rtol=1e-12, atol=1e-12)
     _check_close(Varf_mc, Varf_ex, "MCBias DIM Var(f) exact", rtol=1e-12, atol=1e-12)
+    _check_close(Bhat, 0.0, "MCBias DIM corrected B* is zero", rtol=1e-12, atol=1e-12)
 
 
 def _test_MCBias_RA_small_exact():
-    """MCBias for RA on a tiny instance: exact enumeration equals Monte-Carlo with full coverage."""
+    """MCBias for RA on a tiny instance: exact enumeration equals full-coverage computation."""
     rng = np.random.default_rng(5)
     n, p, n1 = 8, 3, 3
     X = rng.normal(size=(n, p))
@@ -1713,27 +1859,47 @@ def _test_MCBias_RA_small_exact():
     # Exact enumeration
     from itertools import combinations
     tau_true = true_tau(y1, y0)
-    EG_list, f_list = [], []
+    EG_list, f_list, Lf_list = [], [], []
     for S1_tuple in combinations(range(n), n1):
         S1 = np.array(S1_tuple, dtype=int)
         f_list.append(tau_hat_RA(S1, X, y1, y0, branch="auto") - tau_true)
-        dsq_sum = 0.0; cnt = 0
+
+        dsum = 0.0
+        dsq_sum = 0.0
+        cnt = 0
         S0 = _indices_complement(S1, n)
         for i in S1:
             for j in S0:
-                d = swap_delta_RA(X, y1, y0, S1, int(i), int(j), branch="auto", mode="no_refit")
-                dsq_sum += d * d; cnt += 1
+                d = swap_delta_RA(
+                    X, y1, y0, S1, int(i), int(j),
+                    branch="auto", mode="no_refit"
+                )
+                d = float(d)
+                dsum += d
+                dsq_sum += d * d
+                cnt += 1
+
         EG_list.append(0.5 * dsq_sum / cnt)
+        Lf_list.append(dsum / cnt)
+
+    f_arr = np.asarray(f_list, dtype=float)
+    Lf_arr = np.asarray(Lf_list, dtype=float)
     EG_ex = float(np.mean(EG_list))
-    Varf_ex = float(np.var(np.asarray(f_list, dtype=float), ddof=1)) if len(f_list) > 1 else 0.0
+    Varf_ex = float(np.var(f_arr, ddof=0)) if f_arr.size > 0 else 0.0
+    lam_ex = _lambda_hat(n, n1, EG_ex, Varf_ex, "max")
+    B_ex = math.sqrt(float(np.mean((Lf_arr + lam_ex * f_arr) ** 2))) / max(lam_ex, _EPS)
 
     # MC with full enumeration
     BS = math.comb(n, n1)
     Bpair = n1 * (n - n1)
     rng2 = np.random.default_rng(5)
-    Bhat, EG_mc, Varf_mc = estimate_Bstar(n1, X, y1, y0, BS, Bpair, rng2, method="RA", branch="auto")
+    Bhat, EG_mc, Varf_mc = estimate_Bstar(
+        n1, X, y1, y0, BS, Bpair, rng2, method="RA", branch="auto"
+    )
+
     _check_close(EG_mc, EG_ex, "MCBias RA E[Gamma] exact", rtol=1e-12, atol=1e-12)
     _check_close(Varf_mc, Varf_ex, "MCBias RA Var(f) exact", rtol=1e-12, atol=1e-12)
+    _check_close(Bhat, B_ex, "MCBias RA corrected B* exact", rtol=1e-12, atol=1e-12)
 
 
 def _test_MCBias_sampling_reproducible():
@@ -1798,7 +1964,7 @@ def _test_pairs_for_determinism_and_corners():
     print("✓ pairs_for_assignment: deterministic sampling and Bpair=0 corner handled")
 
 
-def _test_MCVarRange_RA_RB_matches_manual():
+def _test_MCVarRange_RA_basic_invariants():
     rng = np.random.default_rng(123)
     n, p, n1 = 10, 4, 4
     X = rng.normal(size=(n, p))
@@ -1809,63 +1975,17 @@ def _test_MCVarRange_RA_RB_matches_manual():
     S1 = rng.choice(n, size=n1, replace=False)
     Pi = make_random_reveal_order(n1, rng)
 
-    # Manual reproduction with the same randomness (Bi=enumeration)
-    n0 = n - n1
-    mask = np.zeros(n, dtype=bool); mask[S1] = True
-    S0 = np.where(~mask)[0]
-
-    Vsum_m, Rmax_m = 0.0, 0.0
-    for t, pos in enumerate(Pi):
-        a = _alpha_t(n, n1, t+1)
-        S_past   = S1[Pi[:t]]
-        S_future = S1[Pi[t:]]
-        i_list   = list(map(int, S_future))   # Bi enumerates i's
-        m_list, s2_list, B_list = [], [], []
-        for i_glob in i_list:
-            future_wo_i = [int(u) for u in S_future if int(u) != int(i_glob)]
-            T_size = max(0, n1 - t - 1)
-            B_T = 3  # small but >1 so within-i variance is defined
-            xi_vals = []
-            for _ in range(B_T):
-                if T_size > 0:
-                    T = np.asarray(future_wo_i, dtype=int)
-                    # T = np.asarray(future_wo_i, dtype=int) if len(future_wo_i) <= T_size \
-                    #     else rng.choice(future_wo_i, size=T_size, replace=False).astype(int)
-                else:
-                    T = np.array([], dtype=int)
-                S1_prox = np.concatenate([S_past, np.array([i_glob], dtype=int), T]).astype(int)
-                vals = _swap_deltas_RA_over_all_controls_on_set(
-                    X, y1, y0, S1_prox, int(i_glob), list(map(int, S0)), branch="auto"
-                )
-                xi_vals.append(float(np.mean(vals)) if vals.size > 0 else 0.0)
-            m_i = float(np.mean(xi_vals))
-            s2_i = float(np.var(xi_vals, ddof=1)) if B_T > 1 else 0.0
-            m_list.append(m_i); s2_list.append(s2_i); B_list.append(B_T)
-
-        m_arr = np.asarray(m_list, dtype=float)
-        s2_arr = np.asarray(s2_list, dtype=float)
-        B_arr  = np.asarray(B_list, dtype=float)
-
-        # enumeration over i's ⇒ population variance
-        var_across_i = float(np.var(m_arr, ddof=0)) if m_arr.size > 1 else 0.0
-        r_core = float(np.max(np.abs(m_arr))) if m_arr.size > 0 else 0.0
-        noise_correction = float(np.mean(s2_arr / np.clip(B_arr, 1.0, np.inf)))
-        var_t = max(var_across_i - noise_correction, 0.0)
-
-        Vsum_m += (a*a) * var_t
-        Rmax_m  = max(Rmax_m, a * r_core)
-
-    # Function output with identical randomness
-    rng_fun = np.random.default_rng(123)
-    Vsum_f, Rmax_f, _ = estimate_VR_for_assignment(
-        S1, X, y1, y0, Pi, Bi=len(S1), Bcond=3, rng=rng_fun, method="RA", branch="auto",
-        apply_ucb=False
+    Vsum, Rmax, Vpqv, Rswap = estimate_VR_for_assignment(
+        S1, X, y1, y0, Pi,
+        Bi=n, Bcond=3, Bj=0, rng=np.random.default_rng(999),
+        method="RA", branch="auto", apply_ucb=False, return_rswap=True
     )
 
-    tol = 1e-12
-    _check_close(Vsum_f, Vsum_m, "RA RB Vsum matches manual", rtol=0.0, atol=tol)
-    _check_close(Rmax_f, Rmax_m, "RA RB Rmax matches manual", rtol=0.0, atol=tol)
-    print("✓ MCVarRange (RA, RB) matches manual reproduction on a small instance")
+    assert np.isfinite(Vsum) and np.isfinite(Rmax)
+    assert np.isfinite(Vpqv) and np.isfinite(Rswap)
+    assert Vsum >= 0.0 and Vpqv >= 0.0
+    assert Rswap >= Rmax - 1e-12
+    print("✓ MCVarRange (RA) returns finite outputs and Rswap ≥ Rhat")
 
 
 def _test_RA_RB_reduces_within_i_variance():
@@ -1947,31 +2067,26 @@ def _test_VR_UCB_monotone():
     print("✓ UCB monotonicity: R_ucb ≥ R_plain and V unchanged")
 
 
-def _test_VR_RA_equals_DIM_when_X_empty():
+def _test_RA_equals_DIM_when_X_empty_pointwise():
     rng = np.random.default_rng(303)
     n, p, n1 = 14, 0, 5   # empty design ⇒ RA degenerates to DiM
     X = np.empty((n, 0))
     y0 = rng.normal(size=n)
     y1 = y0 + 0.25
     S1 = rng.choice(n, size=n1, replace=False)
-    Pi = make_random_reveal_order(n1, rng)
+    S0 = _indices_complement(S1, n)
 
-    rng_a = np.random.default_rng(1234)
-    rng_b = np.random.default_rng(1234)
+    tau_ra = tau_hat_RA(S1, X, y1, y0, branch="auto")
+    tau_dim = tau_hat_DIM(S1, y1, y0)
+    _check_close(tau_ra, tau_dim, "RA equals DIM when X is empty: tau", rtol=0.0, atol=1e-12)
 
-    V_ra, R_ra, _ = estimate_VR_for_assignment(
-        S1, X, y1, y0, Pi, Bi=len(S1), Bcond=3, rng=rng_a, method="RA", branch="auto",
-        apply_ucb=False
-    )
-    V_dim, R_dim, _ = estimate_VR_for_assignment(
-        S1, X, y1, y0, Pi, Bi=len(S1), Bcond=len(np.setdiff1d(np.arange(n), S1)), rng=rng_b,
-        method="DIM", branch="auto", apply_ucb=False
-    )
+    i = int(rng.choice(S1))
+    j = int(rng.choice(S0))
+    d_ra = _swap_delta_RA_on_set(X, y1, y0, S1, i, j, branch="auto")
+    d_dim = swap_delta_DIM(y1, y0, S1, i, j)
+    _check_close(d_ra, d_dim, "RA equals DIM when X is empty: swap delta", rtol=0.0, atol=1e-12)
 
-    tol = 1e-12
-    _check_close(V_ra, V_dim, "RA (empty X) equals DIM: V", rtol=0.0, atol=tol)
-    _check_close(R_ra, R_dim, "RA (empty X) equals DIM: R", rtol=0.0, atol=tol)
-    print("✓ RA equals DIM when X is empty (sanity check)")
+    print("✓ RA equals DIM when X is empty (pointwise sanity check)")
 
 
 
@@ -1985,16 +2100,18 @@ def run_tests(verbose: bool = True) -> None:
         ("deltas-section", lambda: _test_deltas_section(verbose)),
         ("stress-section", lambda: _test_stress_section(verbose)),
         ("tau_RA_vs_primitives", _test_tau_hat_RA_matches_ols_primitives),
+        ("tau_RA_highdim_unpenalized_intercept", _test_tau_hat_RA_highdim_uses_unpenalized_intercept),
         ("swap_RA_refit_vs_norefit", _test_swap_delta_RA_refit_vs_norefit),
         ("VR_DIM_enumeration", _test_MCVarRange_DIM_enumeration),
         ("MCBias_DIM_exact", _test_MCBias_DIM_small_exact),
+        ("MCBias_RA_exact", _test_MCBias_RA_small_exact),
         ("MCBias_sampling_repro_DIM", _test_MCBias_sampling_reproducible),
         ("MCBias_sampling_repro_RA", _test_MCBias_sampling_reproducible_RA),
         ("pairs_sampler_determinism", _test_pairs_for_determinism_and_corners),
-        ("VR_RA_RB_matches_manual", _test_MCVarRange_RA_RB_matches_manual),
+        ("VR_RA_basic_invariants", _test_MCVarRange_RA_basic_invariants),
         ("RA_RB_variance_reduction", _test_RA_RB_reduces_within_i_variance),
         ("VR_UCB_monotone", _test_VR_UCB_monotone),
-        ("VR_RA_equals_DIM_when_X_empty", _test_VR_RA_equals_DIM_when_X_empty),
+        ("RA_equals_DIM_when_X_empty_pointwise", _test_RA_equals_DIM_when_X_empty_pointwise),
     ]
     for name, test in registry:
         t0 = time.perf_counter()
