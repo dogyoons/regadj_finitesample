@@ -3,7 +3,7 @@ ols_primitives.py
 
 Author:     Dogyoon Song
 Created:    2025-09-25
-Revised:    2026-03-25
+Revised:    2026-04-25
 
 Purpose:
     Finite-population data-generation utilities and basic ATE estimators used by
@@ -157,9 +157,9 @@ def complete_randomization_assignments(n: int, n1: int, N: int,
 def make_potential_outcomes(X: np.ndarray, beta1: np.ndarray, beta0: np.ndarray,
                             eps1: np.ndarray, eps0: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    X:      n x p matrix
-    beta:   p x 1 vector
-    y:      n x 1 vector
+    Return potential-outcome vectors
+        y1 = X @ beta1 + eps1,   y0 = X @ beta0 + eps0,
+    where X has shape (n, p) and all vectors are one-dimensional NumPy arrays.
     """
     y1 = X @ beta1 + eps1
     y0 = X @ beta0 + eps0
